@@ -1,9 +1,21 @@
 import { GoogleGenAI } from '@google/genai';
 import { NextRequest, NextResponse } from 'next/server';
 
+import { getServerSession } from '@/lib/auth/server';
+
 export async function POST(request: NextRequest) {
+    const session = await getServerSession();
+    if (!session) {
+        return NextResponse.json({ error: 'unauthenticated' }, { status: 401 });
+    }
+
     try {
-        const { prompt, resolution, aspectRatio, referenceImage, mimeType } = await request.json();
+        const { prompt, resolution, aspectRatio, referenceImage, mimeType } =
+            await request.json();
+        // aspectRatio is forwarded as part of the prompt context; the current
+        // model only honors imageSize, but we keep the parameter so the
+        // frontend can keep its signature.
+        void aspectRatio;
 
         if (!prompt || typeof prompt !== 'string') {
             return NextResponse.json(
@@ -12,7 +24,10 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        console.log('Starting image generation with Gemini:', prompt);
+        console.log('Starting image generation with Gemini:', {
+            userId: session.user.id,
+            prompt,
+        });
 
         const apiKey = process.env.GEMINI_API_KEY;
 
@@ -29,7 +44,7 @@ export async function POST(request: NextRequest) {
 
         const tools = [
             {
-                googleSearch: {}
+                googleSearch: {},
             },
         ];
 
@@ -39,7 +54,7 @@ export async function POST(request: NextRequest) {
                 imageSize: resolution || '1K',
             },
             tools,
-        } as any;
+        } as Record<string, unknown>;
 
         const model = 'gemini-3-pro-image-preview';
 
@@ -56,12 +71,14 @@ export async function POST(request: NextRequest) {
 
         // Add reference image if present
         if (referenceImage) {
-            let cleanData = referenceImage;
-            let finalMimeType = mimeType || 'image/jpeg';
+            let cleanData: string = referenceImage;
+            let finalMimeType: string = mimeType || 'image/jpeg';
 
             // Check if it has a data URI prefix
             if (referenceImage.includes('base64,')) {
-                const matches = referenceImage.match(/^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,(.+)$/);
+                const matches = referenceImage.match(
+                    /^data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,(.+)$/
+                );
                 if (matches) {
                     finalMimeType = matches[1];
                     cleanData = matches[2];
@@ -74,12 +91,14 @@ export async function POST(request: NextRequest) {
                 }
             }
 
-            contents[0].parts.push({
-                // @ts-ignore
+            // The @google/genai types are loose around inlineData on parts;
+            // cast to a permissive shape so TS doesn't complain about the
+            // dynamically-shaped union.
+            (contents[0].parts as unknown as Array<Record<string, unknown>>).push({
                 inlineData: {
                     mimeType: finalMimeType,
-                    data: cleanData
-                }
+                    data: cleanData,
+                },
             });
         }
 
@@ -95,14 +114,21 @@ export async function POST(request: NextRequest) {
         let textResponse = '';
 
         for await (const chunk of response) {
-            if (!chunk.candidates || !chunk.candidates[0]?.content || !chunk.candidates[0]?.content?.parts) {
+            if (
+                !chunk.candidates ||
+                !chunk.candidates[0]?.content ||
+                !chunk.candidates[0]?.content?.parts
+            ) {
                 continue;
             }
 
             const parts = chunk.candidates[0].content.parts;
             for (const part of parts) {
                 if (part.inlineData) {
-                    console.log('Found inline data with mimeType:', part.inlineData.mimeType);
+                    console.log(
+                        'Found inline data with mimeType:',
+                        part.inlineData.mimeType
+                    );
                     imageData = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
                 } else if (part.text) {
                     textResponse += part.text;
@@ -112,16 +138,19 @@ export async function POST(request: NextRequest) {
 
         if (!imageData) {
             if (textResponse) {
-                return NextResponse.json({
-                    error: 'Model returned text instead of image',
-                    details: textResponse
-                }, { status: 500 });
+                return NextResponse.json(
+                    {
+                        error: 'Model returned text instead of image',
+                        details: textResponse,
+                    },
+                    { status: 500 }
+                );
             }
 
             return NextResponse.json(
                 {
                     error: 'No image was generated',
-                    details: 'No image data found in response.'
+                    details: 'No image data found in response.',
                 },
                 { status: 500 }
             );
@@ -131,14 +160,12 @@ export async function POST(request: NextRequest) {
             imageData,
             textResponse,
         });
-
-    } catch (error: any) {
+    } catch (error) {
         console.error('Error generating image:', error);
+        const message =
+            error instanceof Error ? error.message : 'Unknown error';
         return NextResponse.json(
-            {
-                error: 'Failed to generate image',
-                details: error.message || 'Unknown error',
-            },
+            { error: 'Failed to generate image', details: message },
             { status: 500 }
         );
     }

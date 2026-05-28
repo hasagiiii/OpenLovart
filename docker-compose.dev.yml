@@ -1,0 +1,42 @@
+# Local development PostgreSQL for the OpenLovart Go backend.
+#
+# Usage:
+#   docker-compose -f docker-compose.dev.yml up -d
+#
+# Connect with:
+#   postgres://openlovart:openlovart@localhost:5432/openlovart
+#
+# Data persists across container restarts via the `openlovart_pgdata` volume.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: openlovart-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: openlovart
+      POSTGRES_PASSWORD: openlovart
+      POSTGRES_DB: openlovart
+    ports:
+      - "5434:5432" # Use 5434 to avoid conflict with other local Postgres instances
+    volumes:
+      - openlovart_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openlovart -d openlovart"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Mailpit is a tiny SMTP capture server with a web UI. We use it as the
+  # dev-time replacement for a real SMTP relay: the backend sends mail to
+  # localhost:1025; developers read it at http://localhost:8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: openlovart-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI
+
+volumes:
+  openlovart_pgdata:

@@ -3,19 +3,25 @@
 import React, { useState, useEffect, useCallback, useRef, Suspense } from 'react';
 import { ChevronLeft, Plus, Minus, MousePointer2, ChevronDown, Sparkles, Save, Cloud, CloudOff } from 'lucide-react';
 import Link from 'next/link';
-import { useUser } from '@clerk/nextjs';
 import { useSearchParams } from 'next/navigation';
 import { FloatingToolbar } from '@/components/lovart/FloatingToolbar';
 import { CanvasArea, CanvasElement } from '@/components/lovart/CanvasArea';
 import { ImageGeneratorPanel } from '@/components/lovart/ImageGeneratorPanel';
 import { VideoGeneratorPanel } from '@/components/lovart/VideoGeneratorPanel';
 import { AiDesignerPanel } from '@/components/lovart/AiDesignerPanel';
-import { useSupabase } from '@/hooks/useSupabase';
+import { useAuth } from '@/lib/auth/client';
+import {
+    ApiError,
+    createProject,
+    getCanvasElements,
+    getProject,
+    putCanvasElements,
+    updateProject,
+} from '@/lib/api';
 import { v4 as uuidv4 } from 'uuid';
 
 function LovartCanvasContent() {
-    const { user } = useUser();
-    const supabase = useSupabase();
+    const { user, loading: authLoading } = useAuth();
     const searchParams = useSearchParams();
     const projectId = searchParams.get('id');
 
@@ -42,16 +48,19 @@ function LovartCanvasContent() {
     const isSavingRef = useRef(false);
     const needsSaveRef = useRef(false);
 
-    // Save project to Supabase
+    // Save project to backend.
+    //
+    // Strategy:
+    //   - new project: POST /api/projects → PUT /api/projects/:id/canvas-elements
+    //   - existing project: PATCH title  → PUT canvas-elements (full replace)
+    //
+    // The PUT endpoint replaces the entire canvas-elements collection in one
+    // request, which mirrors the previous delete-then-insert flow without the
+    // racy intermediate empty state.
     const saveProject = useCallback(async () => {
         if (!user) {
             console.log('Save skipped: No user logged in');
             setSaveStatus('offline');
-            return;
-        }
-
-        if (!supabase) {
-            console.log('Save skipped: Supabase client not initialized yet');
             return;
         }
 
@@ -67,84 +76,29 @@ function LovartCanvasContent() {
         try {
             setSaveStatus('saving');
 
-            // If we have a project ID, update it; otherwise create a new one
-            if (currentProjectId) {
-                // Update existing project
-                // @ts-ignore - Supabase type inference issue
-                const { error: projectError } = await (supabase as any)
-                    .from('projects')
-                    .update({
-                        title,
-                        updated_at: new Date().toISOString(),
-                    })
-                    .eq('id', currentProjectId);
-
-                if (projectError) throw projectError;
-
-                // Delete existing elements and insert new ones
-                const { error: deleteError } = await supabase
-                    .from('canvas_elements')
-                    .delete()
-                    .eq('project_id', currentProjectId);
-
-                if (deleteError) throw deleteError;
-
-                if (elements.length > 0) {
-                    // Ensure no duplicates before saving
-                    const uniqueElements = Array.from(new Map(elements.map(item => [item.id, item])).values());
-                    console.log('Saving', uniqueElements.length, 'unique elements to database');
-
-                    // @ts-ignore - Supabase type inference issue
-                    const { error: elementsError } = await (supabase as any)
-                        .from('canvas_elements')
-                        .insert(
-                            uniqueElements.map(el => ({
-                                project_id: currentProjectId,
-                                element_data: el,
-                            }))
-                        );
-
-                    if (elementsError) throw elementsError;
-                } else {
-                    console.log('No elements to save (elements array is empty)');
-                }
+            // Resolve / create the project record.
+            let pid = currentProjectId;
+            if (pid) {
+                await updateProject(pid, { title });
             } else {
-                // Create new project
-                const newProjectId = uuidv4();
-                // @ts-ignore - Supabase type inference issue
-                const { error: projectError } = await (supabase as any)
-                    .from('projects')
-                    .insert({
-                        id: newProjectId,
-                        title,
-                    });
-
-                if (projectError) throw projectError;
-
-                if (elements.length > 0) {
-                    // Ensure no duplicates before saving
-                    const uniqueElements = Array.from(new Map(elements.map(item => [item.id, item])).values());
-
-                    // @ts-ignore - Supabase type inference issue
-                    const { error: elementsError } = await (supabase as any)
-                        .from('canvas_elements')
-                        .insert(
-                            uniqueElements.map(el => ({
-                                project_id: newProjectId,
-                                element_data: el,
-                            }))
-                        );
-
-                    if (elementsError) throw elementsError;
-                }
-
-                setCurrentProjectId(newProjectId);
-                window.history.pushState({}, '', `/lovart/canvas?id=${newProjectId}`);
+                const created = await createProject({ title });
+                pid = created.id;
+                setCurrentProjectId(pid);
+                window.history.pushState({}, '', `/lovart/canvas?id=${pid}`);
             }
 
-            console.log('Save successful!');
+            // Replace canvas elements (full set). De-dup defensively.
+            const uniqueElements = Array.from(
+                new Map(elements.map(item => [item.id, item])).values(),
+            );
+            await putCanvasElements(
+                pid,
+                uniqueElements.map(el => ({ id: el.id, element_data: el })),
+            );
+
+            console.log('Save successful!', { count: uniqueElements.length });
             setSaveStatus('saved');
-        } catch (error: any) {
+        } catch (error: unknown) {
             console.error('Failed to save project:', error);
             setSaveStatus('offline');
         } finally {
@@ -155,9 +109,9 @@ function LovartCanvasContent() {
                 saveProject();
             }
         }
-    }, [user, supabase, currentProjectId, title, elements]);
+    }, [user, currentProjectId, title, elements]);
 
-    // Load project from Supabase
+    // Load project from backend.
     const loadProject = useCallback(async (id: string) => {
         if (!user) {
             console.log('Load skipped: No user logged in');
@@ -165,70 +119,62 @@ function LovartCanvasContent() {
             return;
         }
 
-        if (!supabase) {
-            console.log('Load skipped: Supabase client not initialized yet');
-            return;
-        }
-
         try {
             setIsLoading(true);
             console.log('Loading project:', id);
 
-            // 并行加载项目元数据和画布元素，减少数据库往返次数
-            const [projectResult, elementsResult] = await Promise.all([
-                supabase
-                    .from('projects')
-                    .select('*')
-                    .eq('id', id)
-                    .single(),
-                supabase
-                    .from('canvas_elements')
-                    .select('*')
-                    .eq('project_id', id)
+            // Parallel fetch: project metadata + canvas elements.
+            const [project, canvasElements] = await Promise.all([
+                getProject(id),
+                getCanvasElements(id),
             ]);
 
-            // 处理项目元数据
-            if (projectResult.error) throw projectResult.error;
-            const project = projectResult.data;
-            if (project) {
-                console.log('Project loaded:', project);
-                setTitle((project as any).title);
-            }
+            console.log('Project loaded:', project);
+            setTitle(project.title);
 
-            // 处理画布元素
-            if (elementsResult.error) throw elementsResult.error;
-            
-            const canvasElements = elementsResult.data;
-            console.log('Canvas elements loaded:', canvasElements?.length || 0);
-            if (canvasElements && canvasElements.length > 0) {
-                // 去重加载的元素
-                const loadedElements = canvasElements.map((ce: any) => ce.element_data);
+            console.log('Canvas elements loaded:', canvasElements.length);
+            if (canvasElements.length > 0) {
+                // Each row's element_data is opaque JSON from our perspective.
+                // The canvas page itself authored the shape, so cast at the edge.
+                const loadedElements = canvasElements
+                    .map(ce => ce.element_data as CanvasElement)
+                    .filter((el): el is CanvasElement => !!el && typeof el === 'object' && 'id' in el);
                 const uniqueElements = Array.from(
-                    new Map(loadedElements.map((item: any) => [item.id, item])).values()
+                    new Map(loadedElements.map(item => [item.id, item])).values(),
                 );
                 console.log('Unique elements after dedup:', uniqueElements.length);
-                setElements(uniqueElements as CanvasElement[]);
+                setElements(uniqueElements);
             } else {
                 console.log('No canvas elements found for this project');
                 setElements([]);
             }
-        } catch (error: any) {
-            console.error('Failed to load project:', error);
+        } catch (error: unknown) {
+            if (error instanceof ApiError) {
+                console.error('Failed to load project:', error.code, error.status, error.message);
+            } else {
+                console.error('Failed to load project:', error);
+            }
         } finally {
             setIsLoading(false);
         }
-    }, [user, supabase]);
+    }, [user]);
 
     // Load project on mount if ID is provided
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (projectId && user && supabase && !hasLoadedRef.current) {
+        if (authLoading) return;
+
+        if (projectId && user && !hasLoadedRef.current) {
             hasLoadedRef.current = true;
             loadProject(projectId);
         } else if (!projectId) {
             setIsLoading(false);
             // Mark as initialized for new projects
             isInitializedRef.current = true;
+        } else if (!user) {
+            // Logged-out viewer landed on a canvas URL; stop the spinner so the
+            // header can show "未登录" and the user can navigate to /sign-in.
+            setIsLoading(false);
         }
 
         // Check if there's a prompt in URL
@@ -237,7 +183,7 @@ function LovartCanvasContent() {
             setInitialPrompt(prompt);
             setShowChat(true);
         }
-    }, [projectId, user, supabase, loadProject, searchParams]);
+    }, [projectId, user, authLoading, loadProject, searchParams]);
 
     // Mark as initialized after loading completes
     useEffect(() => {
@@ -252,10 +198,10 @@ function LovartCanvasContent() {
     useEffect(() => {
         // Don't auto-save if not initialized, not logged in, or still loading
         if (!user || isLoading || !isInitializedRef.current) {
-            console.log('Auto-save skipped:', { 
-                hasUser: !!user, 
-                isLoading, 
-                isInitialized: isInitializedRef.current 
+            console.log('Auto-save skipped:', {
+                hasUser: !!user,
+                isLoading,
+                isInitialized: isInitializedRef.current,
             });
             return;
         }
@@ -495,6 +441,7 @@ function LovartCanvasContent() {
         try {
             const response = await fetch('/api/generate-image', {
                 method: 'POST',
+                credentials: 'include',
                 headers: {
                     'Content-Type': 'application/json',
                 },
@@ -572,6 +519,7 @@ function LovartCanvasContent() {
         try {
             const response = await fetch('/api/generate-design', {
                 method: 'POST',
+                credentials: 'include',
                 headers: {
                     'Content-Type': 'application/json',
                 },
@@ -649,7 +597,7 @@ function LovartCanvasContent() {
                                 <span className="text-red-600">离线</span>
                             </>
                         )}
-                        {!user && (
+                        {!user && !authLoading && (
                             <span className="text-amber-600">未登录</span>
                         )}
                     </div>

@@ -10,156 +10,113 @@ OpenLovart 是一个基于 AI 的设计平台，让创意设计变得简单而�
 ## ✨ 主要功能
 
 - 🤖 **AI 设计助手** - 通过自然语言对话生成设计方案
-- 🎨 **智能画布** - 可视化编辑器，支持拖拽、缩放、旋转等操作
-- 🖼️ **AI 图像生成** - 集成 Google Gemini 和 X.AI Grok，生成高质量图像
-- 💾 **项目管理** - 保存和管理你的设计项目
-- 👤 **用户系统** - 基于 Clerk 的安全认证和积分系统
-- ☁️ **云端存储** - 使用 Supabase 实现数据持久化
+- 🎨 **智能画布** - 可视化编辑器，支持拖拽、缩放、旋转
+- 🖼️ **AI 图像生成** - 集成 Google Gemini 与 X.AI Grok
+- 💾 **项目管理** - 自托管后端持久化你的项目与画布
+- 👤 **自有用户系统** - 邮箱密码 + Google OIDC + 邮箱验证 + 密码重置
+- ☁️ **可自部署** - 不依赖任何第三方鉴权 / 数据 BaaS
 
 ## 🚀 技术栈
 
-- **框架**: Next.js 16 (App Router)
-- **语言**: TypeScript
-- **样式**: Tailwind CSS 4
-- **认证**: Clerk
-- **数据库**: Supabase (PostgreSQL)
-- **AI 服务**: 
-  - Google Gemini (图像生成)
-  - X.AI Grok (设计建议)
-- **部署**: Vercel
+- **前端**: Next.js 16 (App Router) + TypeScript + Tailwind CSS 4
+- **后端**: Go (Gin + GORM) — 自有鉴权服务
+- **鉴权**: 自研密码鉴权 + Google OIDC，**RS256 JWT + 公开 JWKS**
+- **数据库**: PostgreSQL（citext + pgcrypto）
+- **邮件**: SMTP（开发期用 Mailpit）
+- **AI 服务**:
+  - Google Gemini（图像生成）
+  - X.AI Grok（设计建议）
 
 ## 📦 快速开始
 
-### 1. 克隆项目
+详细步骤见 [SETUP_GUIDE.md](./SETUP_GUIDE.md)。简版：
 
 ```bash
 git clone git@github.com:xiaoju111a/OpenLovart.git
 cd OpenLovart
-```
 
-### 2. 安装依赖
+# 1. 启动 Postgres + Mailpit
+docker compose -f docker-compose.dev.yml up -d
 
-```bash
+# 2. 启动 Go 后端
+cp backend/.env.example backend/.env
+# 在 backend/.env 中填 AUTH_OIDC_STATE_SECRET（>= 32 字节）；
+# JWT RSA 密钥会在 dev 模式下自动生成到 backend/.dev-keys/
+cd backend && go run ./cmd/server
+
+# 3. 启动 Next.js 前端
+cd ..
+cp .env.local.example .env.local
 npm install
-```
-
-### 3. 配置环境变量
-
-复制 `.env.example` 为 `.env.local` 并填入你的 API 密钥：
-
-```bash
-cp .env.example .env.local
-```
-
-编辑 `.env.local` 文件：
-
-```env
-# Clerk Authentication
-NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=your_clerk_publishable_key
-CLERK_SECRET_KEY=your_clerk_secret_key
-
-# Supabase
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
-
-# Google Gemini AI
-GEMINI_API_KEY=your_gemini_api_key
-
-# X.AI Grok API (可选)
-XAI_API_KEY=your_xai_api_key
-```
-
-### 4. 设置数据库
-
-在 Supabase 中执行 `supabase-schema.sql` 创建必要的表：
-
-```sql
--- 在 Supabase SQL Editor 中运行
--- 文件位置: ./supabase-schema.sql
-```
-
-### 5. 配置 Clerk JWT 模板
-
-参考 `CLERK_JWT_SETUP.md` 文档配置 Clerk 的 Supabase JWT 模板。
-
-### 6. 运行开发服务器
-
-```bash
 npm run dev
 ```
 
-打开 [http://localhost:3000](http://localhost:3000) 查看应用。
+打开 [http://localhost:3000](http://localhost:3000)；邮件收件箱在 [http://localhost:8025](http://localhost:8025)（Mailpit）。
 
 ## 🔑 获取 API 密钥
 
-### Clerk (认证服务)
-1. 访问 [Clerk Dashboard](https://dashboard.clerk.com/)
-2. 创建新应用
-3. 复制 Publishable Key 和 Secret Key
+### Google OIDC（用户登录，可选）
+1. [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials
+2. 创建 OAuth client ID（Web application）
+3. Authorized redirect URI 设为 `http://localhost:8080/api/auth/oidc/google/callback`
 
-### Supabase (数据库)
-1. 访问 [Supabase Dashboard](https://supabase.com/dashboard)
-2. 创建新项目
-3. 在 Settings > API 中找到 URL 和 anon key
+### Google Gemini（AI 图像生成）
+1. [Google AI Studio](https://makersuite.google.com/app/apikey) → 创建 API Key
 
-### Google Gemini (AI 服务)
-1. 访问 [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. 创建 API Key
-
-### X.AI Grok (可选)
-1. 访问 [X.AI Console](https://console.x.ai/)
-2. 创建 API Key
+### X.AI Grok（可选）
+1. [X.AI Console](https://console.x.ai/) → 创建 API Key
 
 ## 📁 项目结构
 
 ```
 OpenLovart/
-├── src/
-│   ├── app/                    # Next.js App Router 页面
-│   │   ├── api/               # API 路由
-│   │   ├── lovart/            # 主应用页面
-│   │   └── debug-*/           # 调试工具
-│   ├── components/            # React 组件
-│   │   └── lovart/           # 核心组件
-│   ├── hooks/                # 自定义 Hooks
-│   ├── lib/                  # 工具库
-│   └── middleware.ts         # 中间件
-├── public/                   # 静态资源
-├── supabase-schema.sql      # 数据库架构
-└── .env.example             # 环境变量模板
+├── src/                       # Next.js App Router
+│   ├── app/
+│   │   ├── api/               # AI 服务 BFF（generate-design / image / video）
+│   │   └── lovart/            # 主应用页面
+│   ├── components/lovart/     # 核心 UI 组件
+│   ├── lib/                   # 前端工具（auth client、API helpers）
+│   └── middleware.ts          # 路由守卫
+├── backend/                   # Go 后端（Gin + GORM）
+│   ├── cmd/server             # 入口
+│   ├── internal/auth          # 密码鉴权 + JWT/JWKS + OIDC + cookies
+│   ├── internal/business      # projects / canvas-elements / credits
+│   ├── internal/email         # SMTP + 模板
+│   └── internal/middleware    # CSRF / CORS / RateLimit / RequestID
+├── docker-compose.dev.yml     # Postgres + Mailpit
+├── openspec/                  # 需求与变更提案
+└── README.md
 ```
 
 ## 🛠️ 可用命令
 
+前端：
+
 ```bash
-# 开发模式
-npm run dev
+npm run dev      # 开发
+npm run build    # 生产构建
+npm run start    # 运行生产产物
+npm run lint     # ESLint
+```
 
-# 构建生产版本
-npm run build
+后端：
 
-# 运行生产服务器
-npm run start
-
-# 代码检查
-npm run lint
+```bash
+cd backend
+go run ./cmd/server          # 启动
+go vet ./... && go build ./...   # 静态检查 + 编译
+go test ./...                # 全部测试
 ```
 
 ## 📚 文档
 
-- [Clerk JWT 设置](./CLERK_JWT_SETUP.md)
-- [Grok 集成指南](./GROK_INTEGRATION.md)
-- [用户积分功能](./USER_CREDITS_FEATURE.md)
-- [故障排除](./TROUBLESHOOTING.md)
+- [本地开发设置指南](./SETUP_GUIDE.md)
+- [后端 README](./backend/README.md)
+- [OpenSpec 变更与规格](./openspec/)
 
-## 🚢 部署到 Vercel
+## 🚢 部署
 
-1. 推送代码到 GitHub
-2. 在 [Vercel](https://vercel.com) 导入项目
-3. 配置环境变量（与 `.env.local` 相同）
-4. 部署！
-
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/xiaoju111a/OpenLovart)
+生产环境必须离线生成 RSA 密钥对并以环境变量方式挂载，详见 `backend/README.md`。前端可部署到 Vercel 或任何支持 Next.js 的平台，并把 `BACKEND_INTERNAL_URL` 指向你的后端服务。
 
 ## 🤝 贡献
 
@@ -172,8 +129,7 @@ MIT License
 ## 🙏 致谢
 
 - [Next.js](https://nextjs.org/)
-- [Clerk](https://clerk.com/)
-- [Supabase](https://supabase.com/)
+- [Gin](https://gin-gonic.com/) / [GORM](https://gorm.io/)
 - [Google Gemini](https://ai.google.dev/)
 - [X.AI](https://x.ai/)
 

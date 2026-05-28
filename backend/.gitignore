@@ -1,0 +1,18 @@
+# Local environment overrides
+.env
+.env.local
+
+# Auto-generated dev RSA keypair for JWT signing (Phase 3 KeyStore).
+# Production keys are loaded from AUTH_JWT_*_KEY_PATH and live elsewhere.
+.dev-keys/
+
+# Logs
+*.log
+
+# Compiled binary (default name when running `go build` in this dir)
+/server
+/backend
+
+# Go test/coverage output
+coverage.out
+*.test
