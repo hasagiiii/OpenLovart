@@ -93,6 +93,47 @@ func (r *Repo) ReplaceAllForProject(
 	return inserted, nil
 }
 
+// AppendForProject inserts the supplied elements onto projectID without
+// touching existing ones, after asserting ownership. It is used by the chat
+// agent's image tools to add generated images to a project's canvas. Returns
+// gorm.ErrRecordNotFound when the project is missing or owned by someone else.
+func (r *Repo) AppendForProject(
+	ctx context.Context,
+	projectID, userID uuid.UUID,
+	elements []ElementInput,
+) ([]models.CanvasElement, error) {
+	if len(elements) == 0 {
+		return nil, nil
+	}
+	var inserted []models.CanvasElement
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := assertOwned(ctx, tx, projectID, userID); err != nil {
+			return err
+		}
+		rows := make([]models.CanvasElement, 0, len(elements))
+		for _, e := range elements {
+			rows = append(rows, models.CanvasElement{
+				ProjectID:   projectID,
+				ElementData: e.ElementData,
+			})
+		}
+		if err := tx.Create(&rows).Error; err != nil {
+			return fmt.Errorf("canvas: append: %w", err)
+		}
+		if err := tx.Model(&models.Project{}).
+			Where("id = ?", projectID).
+			Update("updated_at", gorm.Expr("now()")).Error; err != nil {
+			return fmt.Errorf("canvas: bump project updated_at: %w", err)
+		}
+		inserted = rows
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inserted, nil
+}
+
 // assertOwned returns gorm.ErrRecordNotFound when projectID is not owned by
 // userID. Callers map both "missing" and "wrong owner" to a single 404.
 func assertOwned(ctx context.Context, tx *gorm.DB, projectID, userID uuid.UUID) error {

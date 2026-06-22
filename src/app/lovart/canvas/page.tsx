@@ -12,11 +12,14 @@ import { AiDesignerPanel } from '@/components/lovart/AiDesignerPanel';
 import { useAuth } from '@/lib/auth/client';
 import {
     ApiError,
+    chatCompletion,
     createProject,
+    generateImage,
     getCanvasElements,
     getProject,
     putCanvasElements,
     updateProject,
+    type ToolActivity,
 } from '@/lib/api';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -41,6 +44,9 @@ function LovartCanvasContent() {
 
     const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const isInitializedRef = useRef(false);
+    // Backend chat session id; persisted across turns so the agent remembers
+    // prior context for follow-up prompts.
+    const chatSessionIdRef = useRef<string | null>(null);
 
     const handleZoomIn = () => setScale(prev => Math.min(prev + 0.1, 3));
     const handleZoomOut = () => setScale(prev => Math.max(prev - 0.1, 0.1));
@@ -437,74 +443,55 @@ function LovartCanvasContent() {
         aspectRatio: '1:1' | '4:3' | '16:9',
         referenceImage?: string
     ) => {
+        // Map the panel's aspect ratio to a fal image_size preset.
+        const sizeByAspect: Record<typeof aspectRatio, string> = {
+            '1:1': 'square_hd',
+            '4:3': 'landscape_4_3',
+            '16:9': 'landscape_16_9',
+        };
+        void resolution; // fal flux does not take a separate resolution knob.
+
         setIsGenerating(true);
         try {
-            const response = await fetch('/api/generate-image', {
-                method: 'POST',
-                credentials: 'include',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    prompt,
-                    resolution,
-                    aspectRatio,
-                    referenceImage,
-                    mimeType: referenceImage ? 'image/jpeg' : undefined,
-                }),
+            const images = await generateImage({
+                prompt,
+                size: sizeByAspect[aspectRatio],
+                reference_image: referenceImage,
             });
 
-            const data = await response.json();
-
-            if (!response.ok) {
-                throw new Error(data.details || data.error || '生成失败');
+            const url = images[0]?.url;
+            if (!url) {
+                throw new Error('未生成图片');
             }
 
             // Find the selected image-generator element
             const generatorElementId = selectedIds.find(id => elements.find(el => el.id === id)?.type === 'image-generator');
 
-            if (data.imageData) {
-                if (generatorElementId) {
-                    // Replace the generator element with the generated image
-                    setElements(prev => prev.map(el => {
-                        if (el.id === generatorElementId) {
-                            return {
-                                ...el,
-                                type: 'image',
-                                content: data.imageData,
-                            };
-                        }
-                        return el;
-                    }));
-                } else {
-                    // Fallback: Add new image element
-                    const newElement: CanvasElement = {
-                        id: uuidv4(),
-                        type: 'image',
-                        x: 300 - pan.x,
-                        y: 300 - pan.y,
-                        width: 400,
-                        height: 400,
-                        content: data.imageData,
-                    };
-                    setElements(prev => [...prev, newElement]);
-                    setSelectedIds([newElement.id]);
-                }
-            } else if (data.textResponse) {
-                // Handle text response (Design Assistant)
+            if (generatorElementId) {
+                // Replace the generator element with the generated image
+                setElements(prev => prev.map(el => {
+                    if (el.id === generatorElementId) {
+                        return {
+                            ...el,
+                            type: 'image',
+                            content: url,
+                        };
+                    }
+                    return el;
+                }));
+            } else {
+                // Fallback: Add new image element
                 const newElement: CanvasElement = {
                     id: uuidv4(),
-                    type: 'text',
+                    type: 'image',
                     x: 300 - pan.x,
                     y: 300 - pan.y,
-                    content: data.textResponse,
+                    width: 400,
+                    height: 400,
+                    content: url,
                 };
                 setElements(prev => [...prev, newElement]);
                 setSelectedIds([newElement.id]);
-
-                // If there was a generator element, maybe remove it or keep it? 
-                // For now, let's keep it to allow more generations, or remove it if it was a placeholder.
-                // If the user clicked "Generate" from the panel, there might not be a selected generator element on canvas.
             }
         } catch (error) {
             console.error('Generation failed:', error);
@@ -514,31 +501,51 @@ function LovartCanvasContent() {
         }
     };
 
+    // Place tool-generated images (from a chat turn) onto the canvas, reusing
+    // the canvas_element_id the backend already persisted so a later save does
+    // not create duplicates.
+    const addImagesFromToolActivity = (activity?: ToolActivity[]) => {
+        if (!activity) return;
+        const newElements: CanvasElement[] = [];
+        for (const ta of activity) {
+            if (ta.object !== 'tool.result' || ta.error || !ta.result) continue;
+            const result = ta.result as { images?: Array<{ url?: string; canvas_element_id?: string }> };
+            if (!Array.isArray(result.images)) continue;
+            for (const img of result.images) {
+                if (!img.url) continue;
+                newElements.push({
+                    id: img.canvas_element_id || uuidv4(),
+                    type: 'image',
+                    x: 300 - pan.x + (elements.length + newElements.length) * 24,
+                    y: 300 - pan.y + (elements.length + newElements.length) * 24,
+                    width: 400,
+                    height: 400,
+                    content: img.url,
+                });
+            }
+        }
+        if (newElements.length > 0) {
+            setElements(prev => [...prev, ...newElements]);
+            setSelectedIds(newElements.map(el => el.id));
+        }
+    };
+
     const handleAiChat = async (prompt: string): Promise<string> => {
         setIsGenerating(true);
         try {
-            const response = await fetch('/api/generate-design', {
-                method: 'POST',
-                credentials: 'include',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    prompt,
-                }),
+            const completion = await chatCompletion({
+                messages: [{ role: 'user', content: prompt }],
+                sessionId: chatSessionIdRef.current,
+                projectId: currentProjectId,
             });
 
-            const data = await response.json();
+            // Persist the session id so follow-up turns remember context.
+            chatSessionIdRef.current = completion.session_id;
 
-            if (!response.ok) {
-                throw new Error(data.details || data.error || '生成失败');
-            }
+            // Drop any tool-generated images onto the canvas.
+            addImagesFromToolActivity(completion.tool_activity);
 
-            if (data.suggestion) {
-                return data.suggestion;
-            }
-
-            return "未收到回复";
+            return completion.choices?.[0]?.message?.content || '未收到回复';
         } catch (error) {
             console.error('Chat generation failed:', error);
             throw error;

@@ -17,11 +17,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jiantaoli/openlovart/backend/internal/agent"
 	"github.com/jiantaoli/openlovart/backend/internal/auth/cookies"
 	"github.com/jiantaoli/openlovart/backend/internal/auth/jwt"
 	"github.com/jiantaoli/openlovart/backend/internal/auth/oidc"
 	"github.com/jiantaoli/openlovart/backend/internal/auth/ratelimit"
 	"github.com/jiantaoli/openlovart/backend/internal/auth/service"
+	"github.com/jiantaoli/openlovart/backend/internal/business/aiimage"
+	canvas "github.com/jiantaoli/openlovart/backend/internal/business/canvas_elements"
+	"github.com/jiantaoli/openlovart/backend/internal/business/websearch"
 	"github.com/jiantaoli/openlovart/backend/internal/config"
 	"github.com/jiantaoli/openlovart/backend/internal/db"
 	"github.com/jiantaoli/openlovart/backend/internal/email"
@@ -145,6 +149,36 @@ func run() error {
 	oidcLimiter := ratelimit.New(float64(cfg.RateLimitLoginPerMin), oidcBurst)
 	resendLimiter := ratelimit.NewPerHour(float64(cfg.RateLimitRegisterPerHour), forgotBurst)
 
+	// ----- AI generation runtime (trpc-agent-go as a library) -----
+	//
+	// Image service: a provider (fal) behind an in-memory TTL job store, shared
+	// by the async /api/ai/images endpoints and the chat agent's image tools.
+	imageProvider := aiimage.NewFalProvider(cfg.AIImageAPIKey, cfg.AIImageModel)
+	imageService := aiimage.NewService(imageProvider, aiimage.NewMemoryStore())
+
+	// Web search: enabled only when a search key is configured; otherwise the
+	// web_search tool is not registered on the agent.
+	searchProvider, searchEnabled := websearch.New(cfg.AISearchProvider, cfg.AISearchAPIKey)
+	if !searchEnabled {
+		logger.Warn("web search disabled: no AI_SEARCH_API_KEY configured")
+	}
+
+	// Canvas persister: lets the image tools auto-save generated images onto a
+	// project's canvas when a project_id is supplied with the chat request.
+	canvasPersister := agent.NewCanvasPersister(canvas.NewRepo(gormDB))
+
+	chatRuntime := agent.New(agent.Config{
+		AppName:       "openlovart",
+		ChatModel:     cfg.AIChatModel,
+		OpenAIAPIKey:  cfg.OpenAIAPIKey,
+		OpenAIBaseURL: cfg.OpenAIBaseURL,
+	}, imageService, searchProvider, canvasPersister)
+	defer func() {
+		if cErr := chatRuntime.Close(); cErr != nil {
+			logger.Error("chat runtime close failed", slog.String("err", cErr.Error()))
+		}
+	}()
+
 	router := httpserver.New(httpserver.Deps{
 		Cfg:                 cfg,
 		Log:                 logger,
@@ -154,6 +188,8 @@ func run() error {
 		Cookies:             cookieMgr,
 		GoogleVerif:         googleVerif,
 		OIDCSigner:          stateSigner,
+		ChatRuntime:         chatRuntime,
+		ImageService:        imageService,
 		LoginLimiter:        loginLimiter,
 		RegisterLimiter:     registerLimiter,
 		ForgotLimiter:       forgotLimiter,

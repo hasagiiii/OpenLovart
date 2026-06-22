@@ -17,6 +17,8 @@ import (
 	"github.com/jiantaoli/openlovart/backend/internal/auth/oidc"
 	"github.com/jiantaoli/openlovart/backend/internal/auth/ratelimit"
 	"github.com/jiantaoli/openlovart/backend/internal/auth/service"
+	"github.com/jiantaoli/openlovart/backend/internal/business/aichat"
+	"github.com/jiantaoli/openlovart/backend/internal/business/aiimage"
 	canvas "github.com/jiantaoli/openlovart/backend/internal/business/canvas_elements"
 	"github.com/jiantaoli/openlovart/backend/internal/business/credits"
 	"github.com/jiantaoli/openlovart/backend/internal/business/projects"
@@ -37,12 +39,20 @@ type Deps struct {
 	GoogleVerif *oidc.GoogleVerifier
 	OIDCSigner  *oidc.StateSigner
 
+	// AI generation collaborators. ChatRuntime drives the chat endpoint;
+	// ImageService backs the async image endpoints. Both may be nil in tests
+	// that do not exercise the AI routes (the routes are then not mounted).
+	// ChatRuntime is an interface so tests can inject a fake event stream;
+	// *agent.Runtime satisfies it.
+	ChatRuntime  aichat.ChatRunner
+	ImageService *aiimage.Service
+
 	// Per-route limiters. nil values disable that limiter (useful in tests).
-	LoginLimiter           ratelimit.Limiter
-	RegisterLimiter        ratelimit.Limiter
-	ForgotLimiter          ratelimit.Limiter
-	OIDCCallbackLimiter    ratelimit.Limiter
-	VerifyResendLimiter    ratelimit.Limiter
+	LoginLimiter        ratelimit.Limiter
+	RegisterLimiter     ratelimit.Limiter
+	ForgotLimiter       ratelimit.Limiter
+	OIDCCallbackLimiter ratelimit.Limiter
+	VerifyResendLimiter ratelimit.Limiter
 }
 
 // New constructs a configured *gin.Engine using the supplied dependencies.
@@ -161,6 +171,19 @@ func New(d Deps) *gin.Engine {
 		creditsRepo := credits.NewRepo(d.DB)
 		creditsH := credits.NewHandlers(creditsRepo)
 		api.GET("/credits", creditsH.Get)
+
+		// AI generation endpoints. Mounted only when their collaborators are
+		// wired (tests that don't exercise AI can leave them nil).
+		if d.ChatRuntime != nil {
+			chatH := aichat.NewHandlers(d.ChatRuntime, d.Log)
+			api.POST("/ai/chat/completions", chatH.Completions)
+		}
+		if d.ImageService != nil {
+			imageH := aiimage.NewHandlers(d.ImageService)
+			api.POST("/ai/images", imageH.Submit)
+			api.GET("/ai/images/:id/status", imageH.Status)
+			api.GET("/ai/images/:id", imageH.Result)
+		}
 	}
 
 	return engine

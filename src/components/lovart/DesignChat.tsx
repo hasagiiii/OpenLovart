@@ -1,13 +1,18 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Paperclip, AtSign, MapPin, Zap, Globe, Loader2, ArrowUp } from 'lucide-react';
+import { Paperclip, AtSign, MapPin, Zap, Globe, Loader2, ArrowUp } from 'lucide-react';
+import { chatStream, type ChatStreamEvent } from '@/lib/api';
 
 interface Message {
     id: string;
     role: 'user' | 'assistant';
     content: string;
     timestamp: Date;
+    // URLs of images produced by tool calls during this turn.
+    images?: string[];
+    // Transient status line shown while tools run (e.g. "正在生成图片…").
+    toolStatus?: string;
     examples?: Array<{
         title: string;
         description: string;
@@ -18,6 +23,30 @@ interface Message {
 interface DesignChatProps {
     projectId: string;
     initialPrompt?: string;
+    // Called with the canvas element id(s) the backend persisted for
+    // tool-generated images, so the host page can place them on the canvas.
+    onCanvasElementsCreated?: (ids: string[]) => void;
+}
+
+// extractImages pulls image URLs + persisted canvas element ids out of a
+// `tool.result` payload (`{ images: [{ url, canvas_element_id }] }`).
+function extractImages(result: unknown): { urls: string[]; elementIds: string[] } {
+    const urls: string[] = [];
+    const elementIds: string[] = [];
+    if (result && typeof result === 'object' && 'images' in result) {
+        const images = (result as { images?: unknown }).images;
+        if (Array.isArray(images)) {
+            for (const img of images) {
+                if (img && typeof img === 'object') {
+                    const url = (img as { url?: unknown }).url;
+                    const cid = (img as { canvas_element_id?: unknown }).canvas_element_id;
+                    if (typeof url === 'string') urls.push(url);
+                    if (typeof cid === 'string') elementIds.push(cid);
+                }
+            }
+        }
+    }
+    return { urls, elementIds };
 }
 
 const exampleProjects = [
@@ -38,11 +67,14 @@ const exampleProjects = [
     },
 ];
 
-export function DesignChat({ projectId, initialPrompt }: DesignChatProps) {
+export function DesignChat({ projectId, initialPrompt, onCanvasElementsCreated }: DesignChatProps) {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    // The backend session store owns history; we persist the returned
+    // session_id and send it on follow-up turns so context is remembered.
+    const sessionIdRef = useRef<string | null>(null);
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -70,44 +102,102 @@ export function DesignChat({ projectId, initialPrompt }: DesignChatProps) {
             timestamp: new Date(),
         };
 
-        setMessages(prev => [...prev, userMessage]);
+        const assistantId = (Date.now() + 1).toString();
+        const assistantMessage: Message = {
+            id: assistantId,
+            role: 'assistant',
+            content: '',
+            timestamp: new Date(),
+        };
+
+        setMessages(prev => [...prev, userMessage, assistantMessage]);
         setInput('');
         setIsLoading(true);
 
+        const patchAssistant = (patch: Partial<Message>) => {
+            setMessages(prev =>
+                prev.map(m => (m.id === assistantId ? { ...m, ...patch } : m)),
+            );
+        };
+        const appendImages = (urls: string[]) => {
+            if (urls.length === 0) return;
+            setMessages(prev =>
+                prev.map(m =>
+                    m.id === assistantId
+                        ? { ...m, images: [...(m.images ?? []), ...urls] }
+                        : m,
+                ),
+            );
+        };
+
+        const createdElementIds: string[] = [];
+
         try {
-            const response = await fetch('/api/generate-design', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
+            await chatStream(
+                {
+                    messages: [{ role: 'user', content: text }],
+                    sessionId: sessionIdRef.current,
+                    projectId,
                 },
-                body: JSON.stringify({
-                    prompt: text,
-                }),
-            });
+                (ev: ChatStreamEvent) => {
+                    switch (ev.object) {
+                        case 'session':
+                            sessionIdRef.current = ev.session_id;
+                            break;
+                        case 'chat.completion.chunk': {
+                            const delta = ev.choices?.[0]?.delta?.content ?? '';
+                            if (delta) {
+                                setMessages(prev =>
+                                    prev.map(m =>
+                                        m.id === assistantId
+                                            ? { ...m, content: m.content + delta }
+                                            : m,
+                                    ),
+                                );
+                            }
+                            break;
+                        }
+                        case 'tool.call':
+                            patchAssistant({
+                                toolStatus:
+                                    ev.name === 'web_search'
+                                        ? '正在联网搜索…'
+                                        : ev.name === 'edit_image'
+                                          ? '正在编辑图片…'
+                                          : ev.name === 'generate_image'
+                                            ? '正在生成图片…'
+                                            : `正在调用 ${ev.name}…`,
+                            });
+                            break;
+                        case 'tool.result': {
+                            patchAssistant({ toolStatus: undefined });
+                            if (ev.error) break;
+                            const { urls, elementIds } = extractImages(ev.result);
+                            appendImages(urls);
+                            createdElementIds.push(...elementIds);
+                            break;
+                        }
+                        case 'error':
+                            patchAssistant({
+                                content:
+                                    '抱歉，我遇到了一些问题。请稍后再试。',
+                                toolStatus: undefined,
+                            });
+                            break;
+                    }
+                },
+            );
 
-            if (!response.ok) {
-                throw new Error('Failed to get response');
+            // Hand persisted canvas element ids to the host page.
+            if (createdElementIds.length > 0) {
+                onCanvasElementsCreated?.(createdElementIds);
             }
-
-            const data = await response.json();
-
-            const assistantMessage: Message = {
-                id: (Date.now() + 1).toString(),
-                role: 'assistant',
-                content: data.suggestion,
-                timestamp: new Date(),
-            };
-
-            setMessages(prev => [...prev, assistantMessage]);
         } catch (error) {
             console.error('Failed to send message:', error);
-            const errorMessage: Message = {
-                id: (Date.now() + 1).toString(),
-                role: 'assistant',
+            patchAssistant({
                 content: '抱歉，我遇到了一些问题。请稍后再试。',
-                timestamp: new Date(),
-            };
-            setMessages(prev => [...prev, errorMessage]);
+                toolStatus: undefined,
+            });
         } finally {
             setIsLoading(false);
         }
@@ -178,7 +268,28 @@ export function DesignChat({ projectId, initialPrompt }: DesignChatProps) {
                             </div>
                         ) : (
                             <div className="flex flex-col space-y-2">
-                                <p className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">{message.content}</p>
+                                {message.content && (
+                                    <p className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">{message.content}</p>
+                                )}
+                                {message.toolStatus && (
+                                    <div className="flex items-center gap-2 text-gray-400">
+                                        <Loader2 size={14} className="animate-spin" />
+                                        <span className="text-sm">{message.toolStatus}</span>
+                                    </div>
+                                )}
+                                {message.images && message.images.length > 0 && (
+                                    <div className="grid grid-cols-2 gap-2">
+                                        {message.images.map((url, i) => (
+                                            // eslint-disable-next-line @next/next/no-img-element
+                                            <img
+                                                key={`${message.id}-img-${i}`}
+                                                src={url}
+                                                alt="生成的图片"
+                                                className="w-full h-auto rounded-lg border border-gray-100"
+                                            />
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>

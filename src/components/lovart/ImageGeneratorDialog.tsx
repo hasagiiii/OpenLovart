@@ -2,6 +2,7 @@
 
 import React, { useState, useRef } from 'react';
 import { X, Loader2, Sparkles, Image as ImageIcon, ChevronDown, Zap } from 'lucide-react';
+import { generateImage } from '@/lib/api';
 
 interface ImageGeneratorDialogProps {
     isOpen: boolean;
@@ -45,41 +46,36 @@ export function ImageGeneratorDialog({ isOpen, onClose, onImageGenerated }: Imag
         setPreviewImage(null);
 
         try {
-            let referenceDataBase64 = null;
+            // Read the reference image as a data URI (fal accepts data URIs as
+            // image_url for image-to-image).
+            let referenceDataUri: string | undefined = undefined;
             if (referenceImage) {
-                referenceDataBase64 = await new Promise<string>((resolve, reject) => {
+                referenceDataUri = await new Promise<string>((resolve, reject) => {
                     const reader = new FileReader();
                     reader.onload = () => resolve(reader.result as string);
                     reader.onerror = reject;
                     reader.readAsDataURL(referenceImage);
                 });
-                // Extract the base64 part
-                if (referenceDataBase64 && referenceDataBase64.includes(',')) {
-                    referenceDataBase64 = referenceDataBase64.split(',')[1];
-                }
             }
 
-            const response = await fetch('/api/generate-image', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    prompt,
-                    resolution,
-                    aspectRatio,
-                    referenceImage: referenceDataBase64,
-                    mimeType: referenceImage?.type
-                }),
+            const sizeByAspect: Record<AspectRatio, string> = {
+                '1:1': 'square_hd',
+                '4:3': 'landscape_4_3',
+                '16:9': 'landscape_16_9',
+            };
+            void resolution; // fal flux does not take a separate resolution knob.
+
+            const images = await generateImage({
+                prompt,
+                size: sizeByAspect[aspectRatio],
+                reference_image: referenceDataUri,
             });
 
-            const data = await response.json();
-
-            if (!response.ok) {
-                throw new Error(data.details || data.error || '生成失败');
+            const url = images[0]?.url;
+            if (!url) {
+                throw new Error('未生成图片');
             }
-
-            setPreviewImage(data.imageData);
+            setPreviewImage(url);
         } catch (err) {
             console.error('Generation error:', err);
             setError(err instanceof Error ? err.message : '生成图像时出错');

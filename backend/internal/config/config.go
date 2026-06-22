@@ -87,6 +87,32 @@ type Config struct {
 
 	RateLimitLoginPerMin     int `mapstructure:"RATE_LIMIT_LOGIN_PER_MIN"`
 	RateLimitRegisterPerHour int `mapstructure:"RATE_LIMIT_REGISTER_PER_HOUR"`
+
+	// ----- AI generation (chat / image / web search) -----
+
+	// AIChatModel selects the OpenAI-compatible chat model driving the
+	// trpc-agent-go agent (default "gpt-5.4-mini").
+	AIChatModel string `mapstructure:"AI_CHAT_MODEL"`
+
+	// OpenAIAPIKey / OpenAIBaseURL authenticate the chat model. The
+	// trpc-agent-go OpenAI model also reads these from the process
+	// environment; we surface them here for explicit wiring and so a
+	// missing key is a soft (tool-disabled) rather than fatal condition.
+	OpenAIAPIKey  string `mapstructure:"OPENAI_API_KEY"`
+	OpenAIBaseURL string `mapstructure:"OPENAI_BASE_URL"`
+
+	// AIImageProvider selects the image-generation backend (default "fal").
+	// AIImageModel names the provider model; AIImageAPIKey is the provider
+	// credential (the FAL_KEY env var is accepted as a fallback).
+	AIImageProvider string `mapstructure:"AI_IMAGE_PROVIDER"`
+	AIImageModel    string `mapstructure:"AI_IMAGE_MODEL"`
+	AIImageAPIKey   string `mapstructure:"AI_IMAGE_API_KEY"`
+
+	// AISearchProvider selects the web-search backend for the chat agent's
+	// `web_search` tool (default "brave"). AISearchAPIKey is the credential;
+	// when empty the tool is not registered.
+	AISearchProvider string `mapstructure:"AI_SEARCH_PROVIDER"`
+	AISearchAPIKey   string `mapstructure:"AI_SEARCH_API_KEY"`
 }
 
 // Default values applied when neither the environment nor `.env` provides a value.
@@ -105,6 +131,14 @@ const (
 
 	defaultRateLimitLoginPerMin     = 10
 	defaultRateLimitRegisterPerHour = 20
+
+	// AI generation defaults. Credentials intentionally have no default:
+	// when unset the corresponding feature degrades (chat without a key
+	// simply errors at call time; web search without a key is disabled).
+	defaultAIChatModel      = "gpt-5.4-mini"
+	defaultOpenAIBaseURL    = "https://opentk.ai/v1"
+	defaultAIImageProvider  = "fal"
+	defaultAISearchProvider = "brave"
 
 	// minOIDCStateSecretBytes is the minimum acceptable length of
 	// AUTH_OIDC_STATE_SECRET. 32 bytes matches HMAC-SHA256 input width.
@@ -144,6 +178,11 @@ func Load() (*Config, error) {
 	v.SetDefault("RATE_LIMIT_LOGIN_PER_MIN", defaultRateLimitLoginPerMin)
 	v.SetDefault("RATE_LIMIT_REGISTER_PER_HOUR", defaultRateLimitRegisterPerHour)
 
+	v.SetDefault("AI_CHAT_MODEL", defaultAIChatModel)
+	v.SetDefault("OPENAI_BASE_URL", defaultOpenAIBaseURL)
+	v.SetDefault("AI_IMAGE_PROVIDER", defaultAIImageProvider)
+	v.SetDefault("AI_SEARCH_PROVIDER", defaultAISearchProvider)
+
 	// Optional .env file. We do not error if the file is absent.
 	v.SetConfigName(".env")
 	v.SetConfigType("env")
@@ -159,15 +198,42 @@ func Load() (*Config, error) {
 	// Environment variables (always last so they win over the file).
 	v.AutomaticEnv()
 
+	// Credential-style keys have no default value. viper.Unmarshal only
+	// considers keys it already knows about (defaults, config file, or an
+	// explicit bind), so AutomaticEnv alone is not enough — bind them
+	// explicitly so a value present only in the environment is picked up.
+	for _, key := range []string{
+		"OPENAI_API_KEY",
+		"AI_IMAGE_MODEL",
+		"AI_IMAGE_API_KEY",
+		"AI_SEARCH_API_KEY",
+	} {
+		_ = v.BindEnv(key)
+	}
+
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
+	}
+
+	// Accept the conventional FAL_KEY as a fallback for the image-provider
+	// credential when AI_IMAGE_API_KEY is not set.
+	if strings.TrimSpace(cfg.AIImageAPIKey) == "" {
+		if falKey := strings.TrimSpace(os.Getenv("FAL_KEY")); falKey != "" {
+			cfg.AIImageAPIKey = falKey
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// WebSearchEnabled reports whether a web-search credential is configured. When
+// false, the chat agent's `web_search` tool must not be registered.
+func (c *Config) WebSearchEnabled() bool {
+	return strings.TrimSpace(c.AISearchAPIKey) != ""
 }
 
 // Validate ensures the config values are well-formed enough to start the

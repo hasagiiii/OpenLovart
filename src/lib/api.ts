@@ -250,3 +250,214 @@ export async function getCredits(): Promise<Credits> {
   const res = await fetchWithCsrf('/api/credits');
   return jsonOrThrow<Credits>(res);
 }
+
+// ---------- AI: chat ----------
+
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+export interface ToolActivity {
+  object: 'tool.call' | 'tool.result';
+  name: string;
+  arguments?: unknown;
+  // For image tools this is `{ images: [{ url, canvas_element_id, ... }] }`;
+  // for web_search it is `{ results: [...] }`. Typed as unknown — callers
+  // narrow at the edge.
+  result?: unknown;
+  error?: string;
+}
+
+export interface ChatCompletion {
+  id: string;
+  object: string;
+  session_id: string;
+  model: string;
+  choices: Array<{
+    index: number;
+    message: { role: string; content: string };
+    finish_reason?: string;
+  }>;
+  tool_activity?: ToolActivity[];
+}
+
+// chatCompletion performs a non-streaming chat turn. The backend session store
+// owns history, so callers send only the latest user message plus the resolved
+// session_id (echoed back for follow-up turns) and the current project_id.
+export async function chatCompletion(input: {
+  messages: ChatMessage[];
+  sessionId?: string | null;
+  projectId?: string | null;
+}): Promise<ChatCompletion> {
+  const res = await fetchWithCsrf('/api/ai/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      messages: input.messages,
+      stream: false,
+      session_id: input.sessionId ?? undefined,
+      project_id: input.projectId ?? undefined,
+    }),
+  });
+  return jsonOrThrow<ChatCompletion>(res);
+}
+
+// SSE event shapes emitted by the streaming chat endpoint.
+export type ChatStreamEvent =
+  | { object: 'session'; session_id: string }
+  | {
+      object: 'chat.completion.chunk';
+      session_id?: string;
+      model?: string;
+      choices: Array<{ index: number; delta: { content?: string } }>;
+    }
+  | { object: 'tool.call'; name: string; arguments?: unknown }
+  | { object: 'tool.result'; name: string; result?: unknown; error?: string }
+  | { object: 'error'; error: string };
+
+// chatStream performs a streaming chat turn, invoking onEvent for each parsed
+// SSE frame until the `[DONE]` terminator. Honors AbortSignal for cancellation.
+export async function chatStream(
+  input: {
+    messages: ChatMessage[];
+    sessionId?: string | null;
+    projectId?: string | null;
+  },
+  onEvent: (ev: ChatStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetchWithCsrf('/api/ai/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify({
+      messages: input.messages,
+      stream: true,
+      session_id: input.sessionId ?? undefined,
+      project_id: input.projectId ?? undefined,
+    }),
+    signal,
+  });
+
+  if (!res.ok || !res.body) {
+    let body: ApiErrorBody = {};
+    try {
+      body = (await res.json()) as ApiErrorBody;
+    } catch {
+      // ignore
+    }
+    throw new ApiError(
+      body.error ?? 'request_failed',
+      body.message ?? res.statusText,
+      res.status,
+    );
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const dispatch = (raw: string) => {
+    // Each SSE frame is one or more `data: ...` lines.
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice('data:'.length).trim();
+      if (!payload || payload === '[DONE]') continue;
+      try {
+        onEvent(JSON.parse(payload) as ChatStreamEvent);
+      } catch {
+        // ignore malformed frame
+      }
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // Frames are separated by a blank line.
+    let sep: number;
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      dispatch(frame);
+    }
+  }
+  if (buffer.trim()) dispatch(buffer);
+}
+
+// ---------- AI: image generation ----------
+
+export interface AiImage {
+  url: string;
+  width: number;
+  height: number;
+  content_type: string;
+}
+
+export type ImageJobStatus =
+  | 'IN_QUEUE'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'FAILED';
+
+export interface ImageSubmitInput {
+  prompt: string;
+  size?: string;
+  n?: number;
+  reference_image?: string;
+  provider_options?: Record<string, unknown>;
+}
+
+export async function submitImage(
+  input: ImageSubmitInput,
+): Promise<{ request_id: string; status: ImageJobStatus }> {
+  const res = await fetchWithCsrf('/api/ai/images', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  return jsonOrThrow<{ request_id: string; status: ImageJobStatus }>(res);
+}
+
+export async function getImageStatus(
+  id: string,
+): Promise<{ request_id: string; status: ImageJobStatus; error?: string }> {
+  const res = await fetchWithCsrf(`/api/ai/images/${encodeURIComponent(id)}/status`);
+  return jsonOrThrow<{
+    request_id: string;
+    status: ImageJobStatus;
+    error?: string;
+  }>(res);
+}
+
+export async function getImageResult(id: string): Promise<{ images: AiImage[] }> {
+  const res = await fetchWithCsrf(`/api/ai/images/${encodeURIComponent(id)}`);
+  return jsonOrThrow<{ images: AiImage[] }>(res);
+}
+
+// generateImage submits a job and polls until it completes (or fails),
+// returning the produced images. Polls every `intervalMs` up to `timeoutMs`.
+export async function generateImage(
+  input: ImageSubmitInput,
+  opts: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<AiImage[]> {
+  const intervalMs = opts.intervalMs ?? 1500;
+  const timeoutMs = opts.timeoutMs ?? 180_000;
+  const { request_id } = await submitImage(input);
+
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (opts.signal?.aborted) throw new ApiError('aborted', 'aborted', 0);
+    const status = await getImageStatus(request_id);
+    if (status.status === 'COMPLETED') {
+      const { images } = await getImageResult(request_id);
+      return images;
+    }
+    if (status.status === 'FAILED') {
+      throw new ApiError('generation_failed', status.error ?? '生成失败', 500);
+    }
+    if (Date.now() > deadline) {
+      throw new ApiError('timeout', '生成超时', 504);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
